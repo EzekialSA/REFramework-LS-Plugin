@@ -1,0 +1,27 @@
+# Build output
+build/
+out/
+dist/
+*.obj
+*.ilk
+*.pdb
+*.exp
+*.lib
+*.dll
+*.exe
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+*.vcxproj*
+*.sln
+
+# Local dev scratch: hardware probes, deploy scripts, page drafts.
+# Some of these contain a personal toy ID, so keep the whole prefix out.
+_*
+
+# Mod runtime config written by REFramework
+lovense_wilds_config.json
+
+# Never commit credentials of any kind
+.env
+*.ini
