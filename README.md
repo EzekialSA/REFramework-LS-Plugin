@@ -74,7 +74,7 @@ Nothing leaves your machine, and there is no credential to leak or expire.
 | Resident Evil Requiem | `requiem` | Unverified, pre-release guess |
 | Devil May Cry 5 | `dmc5` | Unverified |
 | Street Fighter 6 | `sf6` | Unverified |
-| Monster Hunter Rise | `mhrise` | Untested, but names are researched rather than guessed |
+| Monster Hunter Rise | `mhrise` | **Verified on hardware** |
 | Monster Hunter Stories 3 | `mhstories3` | Unverified |
 | Dragon's Dogma 2 | `dd2` | Unverified |
 | Dead Rising Deluxe Remaster | `deadrising` | Unverified |

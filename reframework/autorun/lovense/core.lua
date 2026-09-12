@@ -119,6 +119,12 @@ function M.start(profile)
             safety_seconds = 45,
             poll_hz = 20,
 
+            -- Off by default. The running commentary below is useful when a
+            -- game patch breaks a path, but it is written every few seconds
+            -- and the log file is never truncated, so leaving it on quietly
+            -- grows a file of hundreds of megabytes.
+            debug_log = false,
+
             events = events,
             hooks = hooks,
 
@@ -170,11 +176,25 @@ function M.start(profile)
 
     load_config()
 
+    -- Every recurring diagnostic goes through here so that one checkbox
+    -- silences all of them. The one-shot dumps behind the Diagnostics buttons
+    -- deliberately do not, since the user just asked for those.
+    local function dlog(message)
+        if config.debug_log then log.info(message) end
+    end
+
     ------------------------------------------------------------------------
     -- reflection helpers
     ------------------------------------------------------------------------
 
     local accessor_cache = {}
+
+    -- Some engine getters throw rather than return nil, and REFramework writes
+    -- a full stack trace for every one. Re-probing a dead name at poll rate
+    -- turns that into hundreds of megabytes of log, so back off after a total
+    -- failure instead of retrying every frame.
+    local accessor_fail = {}
+    local ACCESSOR_RETRY = 2.0
 
     local function type_name_of(obj)
         local ok, td = pcall(function() return obj:get_type_definition() end)
@@ -192,6 +212,8 @@ function M.start(profile)
         function(obj, name) return obj:get_field("<" .. name .. ">k__BackingField") end,
     }
 
+    local ACCESSOR_NAMES = { "get_X()", "X()", "field X", "field _X", "backing field" }
+
     local function member(obj, name)
         if obj == nil then return nil end
 
@@ -203,13 +225,18 @@ function M.start(profile)
             accessor_cache[key] = nil
         end
 
+        local failed_at = accessor_fail[key]
+        if failed_at ~= nil and (now() - failed_at) < ACCESSOR_RETRY then return nil end
+
         for i = 1, #ACCESSORS do
             local ok, res = pcall(ACCESSORS[i], obj, name)
             if ok and res ~= nil then
                 accessor_cache[key] = i
+                accessor_fail[key] = nil
                 return res
             end
         end
+        accessor_fail[key] = now()
         return nil
     end
 
@@ -242,8 +269,16 @@ function M.start(profile)
         return nil
     end
 
-    -- Accepts either a dotted string or a { component = ..., path = ... } table.
+    -- Accepts a dotted string, a { component = ..., path = ... } table, or a
+    -- function taking the player and returning the value. The last form is for
+    -- values no accessor can reach safely, such as a getter that only works
+    -- while the game is inside a particular update.
     local function resolve_spec(root, spec)
+        if type(spec) == "function" then
+            local ok, v = pcall(spec, root)
+            if ok then return v end
+            return nil
+        end
         if type(spec) == "string" then return resolve(root, spec) end
         if type(spec) ~= "table" then return nil end
 
@@ -259,6 +294,7 @@ function M.start(profile)
     end
 
     local function describe_spec(spec)
+        if type(spec) == "function" then return "custom reader" end
         if type(spec) == "string" then return spec end
         if type(spec) ~= "table" then return "?" end
         if spec.component ~= nil then
@@ -1059,7 +1095,7 @@ function M.start(profile)
                 if st.resolved == nil then
                     st.error = (#tried == 0) and "no candidates" or
                         ("none matched: " .. table.concat(tried, ", "))
-                    log.info("[Lovense] hook '" .. tostring(h.event) .. "' UNRESOLVED: " .. st.error)
+                    dlog("[Lovense] hook '" .. tostring(h.event) .. "' UNRESOLVED: " .. st.error)
                 end
             end
         end
@@ -1077,9 +1113,73 @@ function M.start(profile)
     local death_started = nil
     local seen_alive = false
 
+    -- take_damage, heal, low_hp and death are all derived from polled HP, so
+    -- when a profile's player or hp paths are wrong they fail silently and
+    -- look like a dead plugin. Keep reporting while HP is unreadable, then say
+    -- so once when it starts working.
+    local hp_diag_next = 0
+    local hp_diag_ok_logged = false
+
+    -- Bounded trace of HP movement. "Nothing happened" can mean the event
+    -- never fired or that it fired at an intensity too low to feel, and only
+    -- the numbers tell those apart.
+    local hp_trace_left = 40
+
+    -- Walks a dotted path one segment at a time and reports which accessor
+    -- produced each value, so a path that resolves only sometimes can be
+    -- pinned to the exact step that fails.
+    local function probe_path(root, path)
+        local cur, out = root, {}
+        for segment in path:gmatch("[^%.]+") do
+            local matched = false
+            for i = 1, #ACCESSORS do
+                local ok, res = pcall(ACCESSORS[i], cur, segment)
+                if ok and res ~= nil then
+                    out[#out + 1] = string.format("%s=%s (%s)", segment, tostring(res), ACCESSOR_NAMES[i])
+                    cur = res
+                    matched = true
+                    break
+                elseif not ok then
+                    out[#out + 1] = string.format("%s: %s threw", segment, ACCESSOR_NAMES[i])
+                end
+            end
+            if not matched then
+                out[#out + 1] = segment .. " = nil on " .. type_name_of(cur)
+                break
+            end
+        end
+        return table.concat(out, " | ")
+    end
+
+    local function hp_diag(t, plr, hp, hp_path, hp_max, hp_max_path)
+        if type(hp) == "number" then
+            if hp_diag_ok_logged then return end
+            hp_diag_ok_logged = true
+            dlog(string.format("[Lovense] health: readable, hp=%s via %s, hp_max=%s via %s",
+                tostring(hp), tostring(hp_path), tostring(hp_max), tostring(hp_max_path or "unresolved")))
+            return
+        end
+
+        if t < hp_diag_next then return end
+        hp_diag_next = t + 5.0
+        hp_diag_ok_logged = false
+
+        if plr == nil then
+            dlog("[Lovense] health: no player object; none of the profile's " ..
+                "singleton/getter pairs returned one")
+            return
+        end
+
+        local first = as_list((profile.player or {}).hp)[1]
+        local detail = type(first) == "string" and probe_path(plr, first) or "no plain hp path to probe"
+        dlog(string.format("[Lovense] health: hp unreadable on %s, hp_max=%s -- %s",
+            type_name_of(plr), tostring(hp_max), detail))
+    end
+
     local function poll_health(t)
         local plr = get_player()
         if plr == nil then
+            hp_diag(t, nil)
             hp_last = nil
             seen_alive = false
             player_absent_since = player_absent_since or t
@@ -1092,8 +1192,9 @@ function M.start(profile)
         end
         player_absent_since = nil
 
-        local hp = player_path(plr, "hp")
-        local hp_max = player_path(plr, "hp_max")
+        local hp, hp_path = player_path(plr, "hp")
+        local hp_max, hp_max_path = player_path(plr, "hp_max")
+        hp_diag(t, plr, hp, hp_path, hp_max, hp_max_path)
         if type(hp) ~= "number" then return end
         if type(hp_max) == "number" and hp_max > 0 then hp_max_last = hp_max end
 
@@ -1127,6 +1228,12 @@ function M.start(profile)
                 if config.damage.scale_with_hp then
                     scale = clamp((-delta / max) * 4.0, 0.15, 1.0)
                 end
+                if hp_trace_left > 0 then
+                    hp_trace_left = hp_trace_left - 1
+                    dlog(string.format(
+                        "[Lovense] take_damage: %.1f -> %.1f of %.1f (lost %.1f), scale %.2f",
+                        hp_last, hp, max, -delta, scale))
+                end
                 fire("take_damage", scale)
             elseif delta > 0.01 then
                 fire("heal", clamp((delta / max) * 4.0, 0.2, 1.0))
@@ -1138,6 +1245,7 @@ function M.start(profile)
             if not is_dead then
                 is_dead = true
                 death_started = t
+                dlog(string.format("[Lovense] death: hp reached %.1f of %.1f", hp, max))
             end
             if death_started ~= nil and (t - death_started) < config.damage.death_max_seconds then
                 fire("death", 1.0)
@@ -1154,6 +1262,61 @@ function M.start(profile)
             local percent = (hp / max) * 100.0
             if percent <= config.damage.low_hp_percent then
                 fire("low_hp", clamp((config.damage.low_hp_percent - percent) / config.damage.low_hp_percent + 0.3, 0.3, 1.0))
+            end
+        end
+    end
+
+    -- Some things worth feeling are not events the engine exposes, they are
+    -- just numbers that move: a stat that goes up when you collect something,
+    -- a counter that goes down when you spend it. A profile can watch any such
+    -- value and turn a change in the interesting direction into an event.
+    local watch_last = {}
+    -- A watcher that cannot read its value fails on every poll, so the
+    -- complaint is latched and only repeated once the value comes back.
+    local watch_failed = {}
+
+    local function poll_watchers()
+        local list = profile.watchers
+        if list == nil then return end
+
+        local plr = get_player()
+        if plr == nil then
+            watch_last = {}
+            return
+        end
+
+        for i = 1, #list do
+            local w = list[i]
+            -- Several watchers can drive one event, so diagnostics prefer the
+            -- watcher's own name where it has one.
+            local label = w.name or w.event
+            local ok, value = pcall(w.read, plr)
+            if ok and type(value) == "number" then
+                if watch_failed[i] then
+                    watch_failed[i] = nil
+                    dlog(string.format("[Lovense] watcher '%s' readable again, value %s",
+                        tostring(label), tostring(value)))
+                end
+
+                local prev = watch_last[i]
+                if prev ~= nil and value ~= prev then
+                    local rising = value > prev
+                    local wanted = rising == ((w.direction or "up") == "up")
+                    -- The interesting case is a value that moved the wrong
+                    -- way, which looks identical to a broken watcher from the
+                    -- outside, so say which it was.
+                    dlog(string.format("[Lovense] watcher '%s': %s -> %s, %s",
+                        tostring(label), tostring(prev), tostring(value),
+                        wanted and "fired" or "wrong direction, ignored"))
+                    if wanted then
+                        fire(w.event, w.scale or 1.0)
+                    end
+                end
+                watch_last[i] = value
+            elseif not watch_failed[i] then
+                watch_failed[i] = true
+                dlog(string.format("[Lovense] watcher '%s' unreadable: %s",
+                    tostring(label), tostring(value)))
             end
         end
     end
@@ -1244,6 +1407,7 @@ function M.start(profile)
             local poll_dt = (last_poll > 0) and (t - last_poll) or interval
             last_poll = t
             pcall(poll_health, t)
+            pcall(poll_watchers)
             pcall(poll_footsteps, t, poll_dt)
         end
 
@@ -1492,6 +1656,25 @@ function M.start(profile)
                     imgui.text_colored("Player identity addresses: " .. tostring(n) ..
                         " (too few - filter disabled)", 0xFFFFAA00)
                 end
+            end
+
+            imgui.separator()
+            do
+                local toggled
+                toggled, config.debug_log = imgui.checkbox("Log diagnostics to re2_framework_log.txt",
+                    config.debug_log)
+                if toggled then
+                    if config.debug_log then
+                        -- Start the bounded traces over so the log describes
+                        -- what happens from here, not what happened before.
+                        hp_diag_next = 0
+                        hp_diag_ok_logged = false
+                        hp_trace_left = 40
+                    end
+                    save_config()
+                end
+                imgui.text_colored("Off by default. The log is never truncated, so turn this", 0xFFAAAAAA)
+                imgui.text_colored("off again once you have what you need.", 0xFFAAAAAA)
             end
 
             imgui.separator()
